@@ -3,6 +3,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.coverage import MAX_COVERAGE_DOCUMENTS
 from app.mutation import MAX_MUTATION_DOCUMENTS, MAX_RULE_LIMIT, RULE_NAMES
 from app.profile import MAX_PROFILE_DOCUMENTS
 from app.replay import MAX_REPLAY_DOCUMENTS
@@ -384,6 +385,82 @@ class ReplayResponse(BaseModel):
     )
     unattributed: list[ReplayUnattributedError] = Field(
         ..., description="无法归因到报告 issue 的校验错误分组"
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/replay-coverage 回放样本最小覆盖
+# ---------------------------------------------------------------------------
+
+
+class ReplayCoverageRequest(BaseModel):
+    """POST /api/analyses/{id}/replay-coverage 请求体。"""
+
+    documents: list[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_COVERAGE_DOCUMENTS,
+        description=(
+            f"待筛选的 JSON 文档列表（任意 JSON 类型），"
+            f"数量 1..{MAX_COVERAGE_DOCUMENTS}"
+        ),
+    )
+    directions: list[Literal["backward", "forward"]] = Field(
+        default=["backward", "forward"],
+        min_length=1,
+        description="参与覆盖的兼容方向（缺省两个方向都参与）",
+    )
+
+    @model_validator(mode="after")
+    def _dedupe_directions(self):
+        seen: set[str] = set()
+        unique: list[str] = []
+        for name in self.directions:
+            if name not in seen:
+                seen.add(name)
+                unique.append(name)
+        self.directions = unique
+        return self
+
+
+class CoveredIssue(BaseModel):
+    """被选中代表文档覆盖的报告 issue。"""
+
+    direction: Literal["backward", "forward"]
+    path: str
+    code: str
+    severity: Literal["error", "warning"]
+    covered_by: int = Field(
+        ..., ge=0, description="首个覆盖该 issue 的选中文档下标（基于提交顺序，从 0 开始）"
+    )
+
+
+class UncoveredIssue(BaseModel):
+    """目标方向内未被任何提交文档覆盖的报告 issue。"""
+
+    direction: Literal["backward", "forward"]
+    path: str
+    code: str
+    severity: Literal["error", "warning"]
+
+
+class ReplayCoverageResponse(BaseModel):
+    """回放样本最小覆盖选择结果（接口只读，不持久化）。"""
+
+    analysis_id: int
+    total_documents: int = Field(..., ge=0)
+    directions: list[Literal["backward", "forward"]] = Field(
+        ..., description="实际参与覆盖的方向（按 backward、forward 规范顺序输出）"
+    )
+    counts: ReplayCounts = Field(..., description="全部提交文档的原始四向分类统计")
+    selected_indices: list[int] = Field(
+        ..., description="贪心选中的代表文档下标（按选中顺序排列，基于提交顺序从 0 开始）"
+    )
+    covered_issues: list[CoveredIssue] = Field(
+        ..., description="被选中文档覆盖的报告 issue，按报告内 issue 顺序排列"
+    )
+    uncovered_issues: list[UncoveredIssue] = Field(
+        ..., description="目标方向内未被任何提交文档覆盖的报告 issue，按报告内 issue 顺序排列"
     )
 
 

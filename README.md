@@ -17,10 +17,11 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、变异覆盖评估
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、回放样本最小覆盖、变异覆盖评估
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
 │   ├── replay.py        # 样本回放诊断（旧/新双版校验 + backward/forward 分类 + 失败归因到报告 issue）
+│   ├── coverage.py      # 回放样本最小覆盖（逐文档 issue 覆盖集合 + 确定性贪心集合覆盖选择代表文档）
 │   ├── mutation.py      # 样本变异覆盖评估（新 schema 单点变异确定性生成 + 逐变异校验 + 分类 mutation score）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
 │   ├── sarif.py         # SARIF 2.1.0 导出（issue -> result / rule / logicalLocation）
@@ -32,6 +33,7 @@
 │   ├── test_compat.py   # 引擎单元测试（含 if/then/else 条件分支用例）
 │   ├── test_profile.py  # 合规画像引擎单元测试（最深公共失败路径 / 指纹 / 顺序无关）
 │   ├── test_replay.py   # 样本回放引擎单元测试（四向分类 / issue 归因 / 无法归因归并）
+│   ├── test_coverage.py # 回放样本最小覆盖引擎单元测试（贪心选择 / 并列打破 / 方向筛选 / 未覆盖输出）
 │   ├── test_mutation.py # 变异覆盖引擎单元测试（单点变异生成 / 等价过滤 / 上限 / 杀死判定）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
@@ -910,6 +912,94 @@ curl -X POST http://localhost:8000/api/analyses/1/replay \
   跨节点的模糊回退，避免错误归因。
 
 入参为空列表、超过 5000 个文档或缺少 `documents` 字段时返回 `422`。
+
+### `POST /api/analyses/{id}/replay-coverage` — 回放样本最小覆盖
+
+在样本回放的基础上回答"**最少保留哪几篇文档，就能把报告中的 issue 全部
+实锤一遍**"：复用旧 / 新双版校验与 issue 归因，为每篇文档算出它能覆盖
+的报告 issue 集合（按 `direction + path + code + 规则主体` 身份归并），
+再用**确定性贪心集合覆盖**挑出尽可能少的代表文档。接口为**纯只读**
+操作：不修改分析报告、不追加画像快照、不写任何历史；分析编号不存在
+返回 `404`。
+
+请求体：
+
+| 字段         | 类型     | 必填 | 说明                                                   |
+| ------------ | -------- | ---- | ------------------------------------------------------ |
+| `documents`  | any[]    | 是   | 待筛选的 JSON 文档列表（任意类型），数量 1..5000       |
+| `directions` | string[] | 否   | 参与覆盖的兼容方向（`backward` / `forward`），缺省两个方向都参与 |
+
+```bash
+curl -X POST http://localhost:8000/api/analyses/1/replay-coverage \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [
+    {"status": "pending"},
+    {"owner": "alice"},
+    {"status": "pending", "owner": "alice"},
+    {"status": "active", "owner": "alice"}
+  ]}'
+```
+
+响应：
+
+```json
+{
+  "analysis_id": 1,
+  "total_documents": 4,
+  "directions": ["backward", "forward"],
+  "counts": { "valid": 1, "backward": 3, "forward": 0, "invalid_both": 0 },
+  "selected_indices": [0, 1],
+  "covered_issues": [
+    {
+      "direction": "backward",
+      "path": "#",
+      "code": "required_added",
+      "severity": "error",
+      "covered_by": 1
+    },
+    {
+      "direction": "backward",
+      "path": "#",
+      "code": "required_added",
+      "severity": "error",
+      "covered_by": 0
+    },
+    {
+      "direction": "backward",
+      "path": "#/properties/status",
+      "code": "enum_value_removed",
+      "severity": "error",
+      "covered_by": 0
+    }
+  ],
+  "uncovered_issues": []
+}
+```
+
+响应字段：
+
+| 字段                 | 说明                                                                 |
+| -------------------- | -------------------------------------------------------------------- |
+| `counts`             | 全部提交文档的原始四向分类统计（与回放接口口径一致，不受方向筛选影响） |
+| `selected_indices`   | 贪心选中的代表文档下标，按**选中顺序**排列（基于提交顺序，从 0 开始） |
+| `covered_issues[]`   | 被选中文档覆盖的报告 issue，按报告内 issue 顺序排列                   |
+| `covered_issues[].covered_by` | 首个覆盖该 issue 的选中文档下标                               |
+| `uncovered_issues[]` | 目标方向内未被任何提交文档覆盖的报告 issue，按报告内 issue 顺序排列   |
+
+选择规则：
+
+* 每轮从候选文档中选中**新增覆盖 issue 数最多**的一篇；并列时取**文档
+  下标较小**（先提交）者，全程无随机源，同一输入必得同一输出；
+* 只有归类为 `backward` / `forward` 的文档才能覆盖对应方向的 issue；
+  `valid` / `invalid_both` 文档不覆盖任何 issue（仍计入 `counts`）；
+* `directions` 限定参与覆盖的方向：只有该方向的文档参与选择，也只有
+  该方向的报告 issue 计入覆盖目标（不会出现在 `uncovered_issues` 中）；
+* 无法归因到报告 issue 的失败（`no_matching_issue`）不产生任何覆盖；
+* 同一位置同一 code 因**规则主体**不同而存在多条 issue 时（如同时新增
+  两个必填字段），按缺失字段名 / 额外键名区分覆盖。
+
+入参为空列表、超过 5000 个文档、缺少 `documents` 字段或方向列表为空 /
+含非法方向时返回 `422`。
 
 ### `POST /api/analyses/{id}/mutation-coverage` — 样本变异覆盖评估
 

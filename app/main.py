@@ -7,7 +7,7 @@ from jsonschema.exceptions import SchemaError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app import compat, compare, gate, mutation, profile, replay, sarif
+from app import compat, compare, coverage, gate, mutation, profile, replay, sarif
 from app.database import get_db, init_db
 from app.models import Analysis, AnalysisProfile
 from app.schemas import (
@@ -23,6 +23,8 @@ from app.schemas import (
     ProfileCreate,
     ProfileListResponse,
     ProfileResponse,
+    ReplayCoverageRequest,
+    ReplayCoverageResponse,
     ReplayRequest,
     ReplayResponse,
 )
@@ -179,6 +181,26 @@ def replay_analysis(analysis_id: int, payload: ReplayRequest, db: Session = Depe
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
     result = replay.replay_documents(
         row.old_schema, row.new_schema, row.report, payload.documents
+    )
+    return {"analysis_id": analysis_id, **result}
+
+
+@app.post(
+    "/api/analyses/{analysis_id}/replay-coverage",
+    response_model=ReplayCoverageResponse,
+    tags=["analyses"],
+    summary="回放样本最小覆盖：贪心选择能覆盖报告 issue 的最少代表文档",
+)
+def replay_coverage(
+    analysis_id: int, payload: ReplayCoverageRequest, db: Session = Depends(get_db)
+):
+    # 纯只读：只基于已存的两个 schema 与报告做覆盖选择，绝不修改分析记录
+    row = db.get(Analysis, analysis_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="分析记录不存在")
+    result = coverage.select_covering_documents(
+        row.old_schema, row.new_schema, row.report,
+        payload.documents, payload.directions,
     )
     return {"analysis_id": analysis_id, **result}
 

@@ -808,6 +808,145 @@ def test_replay_missing_analysis_returns_404(client):
     assert resp.json()["detail"] == "分析记录不存在"
 
 
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/replay-coverage 回放样本最小覆盖
+# ---------------------------------------------------------------------------
+
+COVERAGE_OLD = {
+    "type": "object",
+    "properties": {"status": {"type": "string", "enum": ["active", "disabled", "pending"]}},
+}
+COVERAGE_NEW = {
+    "type": "object",
+    "properties": {
+        "status": {"type": "string", "enum": ["active", "disabled"]},
+        "owner": {"type": "string"},
+    },
+    "required": ["status", "owner"],
+}
+# 报告 issue（全部 backward，按报告内顺序）：
+#   # required_added(status) / required_added(owner)
+#   #/properties/status enum_value_removed
+
+
+def _coverage_analysis(client):
+    return _create(client, COVERAGE_OLD, COVERAGE_NEW, "coverage-case")
+
+
+def test_replay_coverage_selects_minimal_documents(client):
+    analysis = _coverage_analysis(client)
+    documents = [
+        {"status": "pending"},                    # 0 -> {required owner, enum}
+        {"owner": "o"},                           # 1 -> {required status}
+        {"status": "pending", "owner": "o"},      # 2 -> {enum}（被 doc0 涵盖）
+        {"status": "active", "owner": "o"},       # 3 -> valid
+        42,                                       # 4 -> invalid_both
+    ]
+    resp = client.post(f"/api/analyses/{analysis['id']}/replay-coverage",
+                       json={"documents": documents})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+
+    assert data["analysis_id"] == analysis["id"]
+    assert data["total_documents"] == 5
+    assert data["directions"] == ["backward", "forward"]
+    # 原始四向分类统计
+    assert data["counts"] == {
+        "valid": 1, "backward": 3, "forward": 0, "invalid_both": 1,
+    }
+    # doc0 新增覆盖 2 条优先入选；doc2 不再贡献新覆盖被跳过
+    assert data["selected_indices"] == [0, 1]
+    # covered_issues 按报告内 issue 顺序：required status/owner、enum
+    assert [i["code"] for i in data["covered_issues"]] == [
+        "required_added", "required_added", "enum_value_removed",
+    ]
+    assert [i["covered_by"] for i in data["covered_issues"]] == [1, 0, 0]
+    assert data["uncovered_issues"] == []
+
+
+def test_replay_coverage_direction_filter(client):
+    old = {"type": "object", "required": ["email"],
+           "properties": {"email": {"type": "string"}, "s": {"enum": ["a", "b"]}}}
+    new = {"type": "object",
+           "properties": {"email": {"type": "string"}, "s": {"enum": ["a"]}}}
+    analysis = _create(client, old, new)
+    documents = [
+        {"email": "e", "s": "b"},   # 0 backward -> enum_value_removed
+        {"s": "a"},                 # 1 forward  -> required_added(email)
+        {"email": "e", "s": "a"},   # 2 valid
+    ]
+    resp = client.post(f"/api/analyses/{analysis['id']}/replay-coverage",
+                       json={"documents": documents, "directions": ["forward"]})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["directions"] == ["forward"]
+    assert data["selected_indices"] == [1]
+    assert [i["direction"] for i in data["covered_issues"]] == ["forward"]
+    assert data["uncovered_issues"] == []
+    # 分类统计仍覆盖全部提交文档
+    assert data["counts"] == {
+        "valid": 1, "backward": 1, "forward": 1, "invalid_both": 0,
+    }
+
+
+def test_replay_coverage_reports_uncovered_issues(client):
+    analysis = _coverage_analysis(client)
+    # 只提交合规文档：全部 issue 都未被覆盖
+    resp = client.post(f"/api/analyses/{analysis['id']}/replay-coverage",
+                       json={"documents": [{"status": "active", "owner": "o"}]})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["selected_indices"] == []
+    assert data["covered_issues"] == []
+    assert len(data["uncovered_issues"]) == len(analysis["report"]["issues"])
+    assert {i["severity"] for i in data["uncovered_issues"]} == {"error"}
+
+
+def test_replay_coverage_is_readonly_and_deterministic(client):
+    analysis = _coverage_analysis(client)
+    base = f"/api/analyses/{analysis['id']}"
+    payload = {"documents": [{"status": "pending"}, {"owner": "o"}, 42]}
+
+    first = client.post(base + "/replay-coverage", json=payload)
+    assert first.status_code == 200, first.text
+    second = client.post(base + "/replay-coverage", json=payload)
+    assert second.json() == first.json()
+
+    # 不修改分析记录，也不产生画像快照
+    after = client.get(base).json()
+    assert after["report"] == analysis["report"]
+    assert after["old_schema"] == analysis["old_schema"]
+    assert after["new_schema"] == analysis["new_schema"]
+    assert client.get(base + "/profiles").json()["total"] == 0
+
+
+def test_replay_coverage_validation_errors(client):
+    analysis = _coverage_analysis(client)
+    base = f"/api/analyses/{analysis['id']}/replay-coverage"
+
+    # 空文档列表 -> 422
+    assert client.post(base, json={"documents": []}).status_code == 422
+    # 超过文档上限 -> 422
+    assert client.post(base, json={"documents": [{}] * 5001}).status_code == 422
+    # 缺少 documents 字段 -> 422
+    assert client.post(base, json={}).status_code == 422
+    # 空方向列表 -> 422
+    assert client.post(base, json={
+        "documents": [{}], "directions": [],
+    }).status_code == 422
+    # 非法方向 -> 422
+    assert client.post(base, json={
+        "documents": [{}], "directions": ["sideways"],
+    }).status_code == 422
+
+
+def test_replay_coverage_missing_analysis_returns_404(client):
+    resp = client.post("/api/analyses/999999/replay-coverage",
+                       json={"documents": [{}]})
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "分析记录不存在"
+
+
 def test_replay_after_profile_still_readonly(client):
     analysis = _replay_analysis(client)
     base = f"/api/analyses/{analysis['id']}"
