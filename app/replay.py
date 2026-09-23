@@ -386,6 +386,98 @@ def _attribute(record: dict, direction: str,
 # ---------------------------------------------------------------------------
 
 
+def _evaluate_document(document: Any, old_validator: Any, new_validator: Any,
+                       old_schema: Any, new_schema: Any,
+                       issue_index: dict[tuple[str, str, str, str], dict]) -> dict:
+    """用旧 / 新两版 schema 校验单篇文档并把失败叶子归因到报告 issue。
+
+    供 ``replay_documents`` 与最小覆盖模块（``app.coverage``）共用，保证两
+    条链路的四向分类与 issue 归因完全一致。返回：
+
+    ``classification``
+        ``valid`` / ``backward`` / ``forward`` / ``invalid_both`` 四者之一；
+    ``hit_keys``
+        该文档命中的报告 issue 身份集合
+        ``(direction, path, code, subject)``，同一文档对同一 issue 最多一次；
+    ``unattributed``
+        无法归因的叶子列表 ``(归并键, 分组模板)``，已按文档内同键去重；
+        计数与示例下标由调用方跨文档聚合。
+    """
+    old_errors = list(old_validator.iter_errors(document))
+    new_errors = list(new_validator.iter_errors(document))
+    old_ok, new_ok = not old_errors, not new_errors
+
+    if old_ok and new_ok:
+        return {"classification": "valid", "hit_keys": set(), "unattributed": []}
+
+    if old_ok and not new_ok:
+        classification, direction, failing_errors, failing_schema = (
+            "backward", "backward", new_errors, new_schema)
+    elif new_ok and not old_ok:
+        classification, direction, failing_errors, failing_schema = (
+            "forward", "forward", old_errors, old_schema)
+    else:
+        # 两版都拒绝：两侧叶子都作为无法归因错误收集
+        classification, direction, failing_errors, failing_schema = (
+            "invalid_both", None, old_errors + new_errors, None)
+
+    # 先展平错误树；只有确实出现 false 子 schema 叶子（jsonschema 对其
+    # 不补路径）时，才按文档做 schema 预扫描定位，避免正常文档的额外开销
+    leaves: list[Any] = []
+    for top_error in failing_errors:
+        leaves.extend(_collect_leaves(top_error))
+
+    false_map: dict[int, list[str]] = {}
+    if any(_is_false_leaf(leaf) for leaf in leaves):
+        if direction is None:
+            for scanned in (_find_false_pointers(old_schema, document),
+                            _find_false_pointers(new_schema, document)):
+                for key, pointers in scanned.items():
+                    bucket = false_map.setdefault(key, [])
+                    bucket.extend(p for p in pointers if p not in bucket)
+        else:
+            false_map = _find_false_pointers(failing_schema, document)
+
+    hit_keys: set[tuple[str, str, str, str]] = set()
+    unattributed: list[tuple[tuple, dict]] = []
+    unattr_keys_this_doc: set[tuple] = set()
+
+    for leaf in leaves:
+        is_false = _is_false_leaf(leaf)
+        false_pointers = list(false_map.get(id(leaf.instance), [])) if is_false else None
+        record = _build_record(leaf, false_pointers)
+        leaf_dir = direction or "both"
+
+        if direction is not None:
+            issue = _attribute(record, direction, issue_index)
+            if issue is not None:
+                hit_keys.add((direction, issue["path"], issue["code"],
+                              _issue_subject(issue)))
+                continue
+            reason = "no_matching_issue"
+        else:
+            reason = "rejected_by_both"
+
+        un_key = (
+            leaf_dir, reason, record["node"],
+            record["validator"], record["subject"],
+        )
+        if un_key in unattr_keys_this_doc:
+            continue
+        unattr_keys_this_doc.add(un_key)
+        unattributed.append((un_key, {
+            "direction": leaf_dir,
+            "reason": reason,
+            "pointer": record["node"],
+            "validator": record["validator"],
+            "schema_pointer": record["schema_pointer"],
+            "message": record["message"],
+        }))
+
+    return {"classification": classification,
+            "hit_keys": hit_keys, "unattributed": unattributed}
+
+
 def replay_documents(old_schema: Any, new_schema: Any, report: dict,
                      documents: list[Any]) -> dict:
     """用旧 / 新两版 schema 回放文档并归因到报告 issue（纯函数）。
@@ -397,103 +489,36 @@ def replay_documents(old_schema: Any, new_schema: Any, report: dict,
     issue_index = _index_issues(report)
 
     # issue 身份 (direction, path, code, subject) -> 命中聚合
-    hits: "OrderedDict[tuple[str, str, str, str], dict]" = OrderedDict()
+    hits: OrderedDict[tuple[str, str, str, str], dict] = OrderedDict()
     # 未归因错误按 (direction, reason, node, validator, subject) 归并
-    unattributed: "OrderedDict[tuple, dict]" = OrderedDict()
+    unattributed: OrderedDict[tuple, dict] = OrderedDict()
 
-    valid = backward = forward = invalid_both = 0
+    counters = {"valid": 0, "backward": 0, "forward": 0, "invalid_both": 0}
 
     for index, document in enumerate(documents):
-        old_errors = list(old_validator.iter_errors(document))
-        new_errors = list(new_validator.iter_errors(document))
-        old_ok, new_ok = not old_errors, not new_errors
+        evaluated = _evaluate_document(
+            document, old_validator, new_validator,
+            old_schema, new_schema, issue_index)
+        counters[evaluated["classification"]] += 1
 
-        if old_ok and new_ok:
-            valid += 1
-            continue
-
-        if old_ok and not new_ok:
-            direction, failing_errors, failing_schema = (
-                "backward", new_errors, new_schema)
-            backward += 1
-        elif new_ok and not old_ok:
-            direction, failing_errors, failing_schema = (
-                "forward", old_errors, old_schema)
-            forward += 1
-        else:
-            # 两版都拒绝：两侧叶子都作为无法归因错误收集
-            direction = None
-            failing_errors = old_errors + new_errors
-            failing_schema = None
-            invalid_both += 1
-
-        # 先展平错误树；只有确实出现 false 子 schema 叶子（jsonschema 对其
-        # 不补路径）时，才按文档做 schema 预扫描定位，避免正常文档的额外开销
-        leaves: list[Any] = []
-        for top_error in failing_errors:
-            leaves.extend(_collect_leaves(top_error))
-
-        false_map: dict[int, list[str]] = {}
-        if any(_is_false_leaf(leaf) for leaf in leaves):
-            if direction is None:
-                for scanned in (_find_false_pointers(old_schema, document),
-                                _find_false_pointers(new_schema, document)):
-                    for key, pointers in scanned.items():
-                        bucket = false_map.setdefault(key, [])
-                        bucket.extend(p for p in pointers if p not in bucket)
+        for key in evaluated["hit_keys"]:
+            bucket = hits.get(key)
+            if bucket is None:
+                hits[key] = {
+                    "issue": issue_index[key],
+                    "count": 1,
+                    "example_indices": [index],
+                }
             else:
-                false_map = _find_false_pointers(failing_schema, document)
+                bucket["count"] += 1
+                if len(bucket["example_indices"]) < MAX_EXAMPLE_INDICES:
+                    bucket["example_indices"].append(index)
 
-        hit_keys_this_doc: set[tuple[str, str, str, str]] = set()
-        unattr_keys_this_doc: set[tuple] = set()
-
-        for leaf in leaves:
-            is_false = _is_false_leaf(leaf)
-            false_pointers = list(false_map.get(id(leaf.instance), [])) if is_false else None
-            record = _build_record(leaf, false_pointers)
-            leaf_dir = direction or "both"
-
-            if direction is not None:
-                issue = _attribute(record, direction, issue_index)
-                if issue is not None:
-                    key = (direction, issue["path"], issue["code"],
-                           _issue_subject(issue))
-                    if key in hit_keys_this_doc:
-                        continue
-                    hit_keys_this_doc.add(key)
-                    bucket = hits.get(key)
-                    if bucket is None:
-                        hits[key] = {
-                            "issue": issue,
-                            "count": 1,
-                            "example_indices": [index],
-                        }
-                    else:
-                        bucket["count"] += 1
-                        if len(bucket["example_indices"]) < MAX_EXAMPLE_INDICES:
-                            bucket["example_indices"].append(index)
-                    continue
-                reason = "no_matching_issue"
-            else:
-                reason = "rejected_by_both"
-
-            un_key = (
-                leaf_dir, reason, record["node"],
-                record["validator"], record["subject"],
-            )
-            if un_key in unattr_keys_this_doc:
-                continue
-            unattr_keys_this_doc.add(un_key)
-
+        for un_key, template in evaluated["unattributed"]:
             group = unattributed.get(un_key)
             if group is None:
                 unattributed[un_key] = {
-                    "direction": leaf_dir,
-                    "reason": reason,
-                    "pointer": record["node"],
-                    "validator": record["validator"],
-                    "schema_pointer": record["schema_pointer"],
-                    "message": record["message"],
+                    **template,
                     "count": 1,
                     "example_indices": [index],
                 }
@@ -505,12 +530,7 @@ def replay_documents(old_schema: Any, new_schema: Any, report: dict,
     total = len(documents)
     return {
         "total_documents": total,
-        "counts": {
-            "valid": valid,
-            "backward": backward,
-            "forward": forward,
-            "invalid_both": invalid_both,
-        },
+        "counts": counters,
         "issue_hits": _render_issue_hits(report, hits),
         "unattributed": sorted(
             unattributed.values(),

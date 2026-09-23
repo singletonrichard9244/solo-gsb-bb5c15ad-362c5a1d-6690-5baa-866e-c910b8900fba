@@ -3,6 +3,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.coverage import MAX_COVERAGE_DOCUMENTS
 from app.mutation import MAX_MUTATION_DOCUMENTS, MAX_RULE_LIMIT, RULE_NAMES
 from app.profile import MAX_PROFILE_DOCUMENTS
 from app.replay import MAX_REPLAY_DOCUMENTS
@@ -384,6 +385,111 @@ class ReplayResponse(BaseModel):
     )
     unattributed: list[ReplayUnattributedError] = Field(
         ..., description="无法归因到报告 issue 的校验错误分组"
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/analyses/{id}/replay-coverage 回放样本最小覆盖
+# ---------------------------------------------------------------------------
+
+
+class ReplayCoverageRequest(BaseModel):
+    """POST /api/analyses/{id}/replay-coverage 请求体。"""
+
+    documents: list[Any] = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_COVERAGE_DOCUMENTS,
+        description=(
+            f"候选回放 JSON 文档列表（任意类型），数量 1..{MAX_COVERAGE_DOCUMENTS}"
+        ),
+    )
+    directions: list[Literal["backward", "forward"]] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "参与覆盖的兼容方向筛选（至少一个），重复值按固定顺序去重；"
+            "只统计与选中命中这些方向 issue 的覆盖情况"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _dedupe_directions(self):
+        seen: set[str] = set()
+        unique: list[str] = []
+        for name in self.directions:
+            if name not in seen:
+                seen.add(name)
+                unique.append(name)
+        # 按固定方向顺序排列，保证同一筛选语义的请求体（如顺序不同）结果一致
+        order = {"backward": 0, "forward": 1}
+        self.directions = sorted(unique, key=order.get)
+        return self
+
+
+class CoveredIssueRef(BaseModel):
+    """被选中文档覆盖的一条报告 issue 引用。"""
+
+    direction: Literal["backward", "forward"]
+    path: str
+    code: str
+    severity: Literal["error", "warning"]
+    reason: str
+    covered_by: list[int] = Field(
+        ..., description="覆盖该 issue 的选中文档下标（基于提交顺序，从 0 开始，升序）"
+    )
+
+
+class UncoveredIssueRef(BaseModel):
+    """提交的候选文档均无法覆盖的一条报告 issue 引用。"""
+
+    direction: Literal["backward", "forward"]
+    path: str
+    code: str
+    severity: Literal["error", "warning"]
+    reason: str
+
+
+class SelectedDocument(BaseModel):
+    """贪心集合覆盖选出的一篇代表文档。"""
+
+    index: int = Field(..., ge=0, description="文档在提交列表中的下标（从 0 开始）")
+    classification: Literal["valid", "backward", "forward", "invalid_both"] = Field(
+        ..., description="该文档的旧 / 新双版校验分类（与回放接口四类一致）"
+    )
+    newly_covered_issues: int = Field(
+        ..., ge=1, description="选中该文档时相对已覆盖集合新增的 issue 数（必定 >= 1）"
+    )
+    covered_issues: int = Field(
+        ..., ge=1, description="该文档可命中的筛选方向内 issue 总数（含与前序代表重复覆盖的部分）"
+    )
+
+
+class ReplayCoverageResponse(BaseModel):
+    """回放样本最小覆盖选择结果（接口只读，不持久化）。"""
+
+    analysis_id: int
+    total_documents: int = Field(..., ge=0)
+    directions: list[Literal["backward", "forward"]] = Field(
+        ..., description="实际生效的方向筛选（去重、固定顺序）"
+    )
+    counts: ReplayCounts = Field(..., description="全部候选文档的原始四向分类计数（不做方向筛选）")
+    total_issues: int = Field(
+        ..., ge=0, description="筛选方向内报告 issue 总数（按业务身份去重）"
+    )
+    covered_issue_count: int = Field(..., ge=0)
+    uncovered_issue_count: int = Field(..., ge=0)
+    selected_indices: list[int] = Field(
+        ..., description="贪心选中的代表文档下标（按选中先后，即新增覆盖递减、并列索引升序）"
+    )
+    selected_documents: list[SelectedDocument] = Field(
+        ..., description="代表文档明细，顺序与 selected_indices 一致"
+    )
+    covered_issues: list[CoveredIssueRef] = Field(
+        ..., description="被覆盖的 issue（按报告内 issue 顺序）"
+    )
+    uncovered_issues: list[UncoveredIssueRef] = Field(
+        ..., description="候选文档均无法覆盖的 issue（按报告内 issue 顺序）"
     )
 
 

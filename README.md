@@ -17,10 +17,11 @@
 ```
 .
 ├── app/
-│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、变异覆盖评估
+│   ├── main.py          # FastAPI 路由：创建分析、查询报告、基线对比、发布门禁、SARIF 导出、合规画像、样本回放、回放最小覆盖、变异覆盖评估
 │   ├── compat.py        # 兼容性分析引擎（递归比较 + 最小反例生成）
 │   ├── profile.py       # 合规画像引擎（批量文档校验 + oneOf/anyOf 最深公共失败路径 + 稳定指纹归并）
 │   ├── replay.py        # 样本回放诊断（旧/新双版校验 + backward/forward 分类 + 失败归因到报告 issue）
+│   ├── coverage.py      # 回放样本最小覆盖（确定性贪心集合覆盖，复用回放校验与归因选择最少代表文档）
 │   ├── mutation.py      # 样本变异覆盖评估（新 schema 单点变异确定性生成 + 逐变异校验 + 分类 mutation score）
 │   ├── compare.py       # 报告基线对比（issue 指纹 + 新增/修复/仍存/级别变化分类）
 │   ├── sarif.py         # SARIF 2.1.0 导出（issue -> result / rule / logicalLocation）
@@ -32,6 +33,7 @@
 │   ├── test_compat.py   # 引擎单元测试（含 if/then/else 条件分支用例）
 │   ├── test_profile.py  # 合规画像引擎单元测试（最深公共失败路径 / 指纹 / 顺序无关）
 │   ├── test_replay.py   # 样本回放引擎单元测试（四向分类 / issue 归因 / 无法归因归并）
+│   ├── test_coverage.py # 回放最小覆盖引擎单元测试（贪心选择 / 并列排序 / 方向筛选 / 未覆盖 issue）
 │   ├── test_mutation.py # 变异覆盖引擎单元测试（单点变异生成 / 等价过滤 / 上限 / 杀死判定）
 │   ├── test_compare.py  # 基线对比单元测试
 │   ├── test_gate.py     # 发布门禁单元测试
@@ -910,6 +912,109 @@ curl -X POST http://localhost:8000/api/analyses/1/replay \
   跨节点的模糊回退，避免错误归因。
 
 入参为空列表、超过 5000 个文档或缺少 `documents` 字段时返回 `422`。
+
+### `POST /api/analyses/{id}/replay-coverage` — 回放样本最小覆盖
+
+在[样本回放诊断](#post-apianalysesidreplay--样本回放诊断)的**旧 / 新双版
+校验与 issue 归因**之上，解决"从一大批候选文档中挑出**尽可能少的代表
+文档**，让报告中每条可被样本触发的 issue 至少被一篇代表文档命中"的问题
+（集合覆盖）。接口为**纯只读**操作：不修改分析报告、不追加画像快照、
+不写任何历史；分析编号不存在返回 `404`。
+
+请求体：
+
+| 字段          | 类型     | 必填 | 说明                                                 |
+| ------------- | -------- | ---- | ---------------------------------------------------- |
+| `documents`   | any[]    | 是   | 候选回放 JSON 文档列表（任意类型），数量 1..5000     |
+| `directions`  | string[] | 是   | 参与覆盖的方向筛选（至少一个，`backward` / `forward`，重复值自动去重） |
+
+**确定性贪心集合覆盖**：每篇候选文档经双版校验后得到它能覆盖的报告
+issue 集合（身份为 `direction + path + code + 规则主体`，与回放归因一致），
+随后逐轮选择代表文档直到没有文档能再带来新增覆盖。每轮的排序键为：
+
+1. **新增覆盖数**（相对已覆盖集合的边际收益）大者优先；
+2. 新增覆盖数相同时，**文档索引**（提交顺序下标）小者优先。
+
+只覆盖零边际收益 issue 的文档（`valid` / 两版都拒绝 / 仅命中已覆盖
+issue）不会被选中；候选文档都无法命中的 issue 进入 `uncovered_issues`。
+
+```bash
+curl -X POST http://localhost:8000/api/analyses/1/replay-coverage \
+  -H "Content-Type: application/json" \
+  -d '{"documents": [
+    {"status": "active", "owner": "alice"},
+    {"status": "pending"},
+    {"status": "active"},
+    42
+  ], "directions": ["backward"]}'
+```
+
+响应：
+
+```json
+{
+  "analysis_id": 1,
+  "total_documents": 4,
+  "directions": ["backward"],
+  "counts": { "valid": 1, "backward": 2, "forward": 0, "invalid_both": 1 },
+  "total_issues": 3,
+  "covered_issue_count": 2,
+  "uncovered_issue_count": 1,
+  "selected_indices": [1],
+  "selected_documents": [
+    {
+      "index": 1,
+      "classification": "backward",
+      "newly_covered_issues": 2,
+      "covered_issues": 2
+    }
+  ],
+  "covered_issues": [
+    {
+      "direction": "backward",
+      "path": "#",
+      "code": "required_added",
+      "severity": "error",
+      "reason": "旧版中 'owner' 可以缺省，新版 required 包含该字段……",
+      "covered_by": [1]
+    },
+    {
+      "direction": "backward",
+      "path": "#/properties/status",
+      "code": "enum_value_removed",
+      "severity": "error",
+      "reason": "旧版枚举包含 \"pending\"，新版枚举不再包含该值……",
+      "covered_by": [1]
+    }
+  ],
+  "uncovered_issues": [
+    {
+      "direction": "backward",
+      "path": "#",
+      "code": "required_added",
+      "severity": "error",
+      "reason": "旧版中 'status' 可以缺省，新版 required 包含该字段……"
+    }
+  ]
+}
+```
+
+响应字段：
+
+| 字段                              | 说明                                                            |
+| --------------------------------- | --------------------------------------------------------------- |
+| `directions`                      | 实际生效的方向筛选（去重后按 backward → forward 固定顺序）      |
+| `counts`                          | **全部候选文档**的原始四向分类计数（不做方向筛选，与回放接口一致） |
+| `total_issues`                    | 筛选方向内报告 issue 总数（按业务身份去重）                     |
+| `selected_indices`                | 贪心选中的代表文档下标（按选中先后；并列时新增覆盖数大、索引小者优先） |
+| `selected_documents[].classification` | 代表文档的原始四向分类                                     |
+| `selected_documents[].newly_covered_issues` | 该文档在被选中轮次新增覆盖的 issue 数（必定 ≥ 1）         |
+| `selected_documents[].covered_issues` | 该文档可命中的筛选方向内 issue 总数（含与前序代表重复覆盖部分） |
+| `covered_issues[]`                | 被覆盖的 issue（按报告内顺序），`covered_by` 给出覆盖它的代表下标（升序） |
+| `uncovered_issues[]`              | 候选文档均无法覆盖的 issue（按报告内顺序）                      |
+
+入参为空列表、超过 5000 个文档、缺少 `documents` / `directions` 字段、
+`directions` 为空或含非法方向时返回 `422`。
 
 ### `POST /api/analyses/{id}/mutation-coverage` — 样本变异覆盖评估
 
